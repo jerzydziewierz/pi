@@ -144,6 +144,8 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	SideQueryMode,
+	SideQueryOptions,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,

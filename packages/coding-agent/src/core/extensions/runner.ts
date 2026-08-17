@@ -2,8 +2,15 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model, Provider, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { AgentMessage, SideQueryOptions } from "@earendil-works/pi-agent-core";
+import type {
+	AssistantMessageEventStream,
+	ImageContent,
+	Message,
+	Model,
+	Provider,
+	ProviderHeaders,
+} from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
@@ -168,7 +175,11 @@ export type NewSessionHandler = (options?: {
 
 export type ForkHandler = (
 	entryId: string,
-	options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	options?: {
+		position?: "before" | "at";
+		appendMessages?: Message[];
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+	},
 ) => Promise<{ cancelled: boolean }>;
 
 export type NavigateTreeHandler = (
@@ -285,6 +296,10 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private sideQueryFn: (input: string, options: SideQueryOptions) => Promise<AssistantMessageEventStream> =
+		async () => {
+			throw new Error("Side queries are unavailable before the extension runtime is bound.");
+		};
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () => ({ cwd: this.cwd });
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
@@ -294,6 +309,7 @@ export class ExtensionRunner {
 	private shutdownHandler: ShutdownHandler = () => {};
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
+	private readonly sideQueryPayloadWarningPaths = new Set<string>();
 	private staleMessage: string | undefined;
 
 	constructor(
@@ -348,6 +364,7 @@ export class ExtensionRunner {
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
+		this.sideQueryFn = contextActions.sideQuery;
 		this.getSystemPromptOptionsFn = contextActions.getSystemPromptOptions ?? (() => ({ cwd: this.cwd }));
 
 		// Flush provider registrations queued during extension loading
@@ -747,6 +764,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			sideQuery: (input, options) => {
+				runner.assertActive();
+				return runner.sideQueryFn(input, options);
+			},
 		};
 	}
 
@@ -1013,7 +1034,7 @@ export class ExtensionRunner {
 		return currentMessages;
 	}
 
-	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
+	async emitBeforeProviderRequest(payload: unknown, options?: { warnForSideQuery?: boolean }): Promise<unknown> {
 		const ctx = this.createContext();
 		let currentPayload = payload;
 
@@ -1029,6 +1050,15 @@ export class ExtensionRunner {
 					};
 					const handlerResult = await handler(event, ctx);
 					if (handlerResult !== undefined) {
+						if (options?.warnForSideQuery && !this.sideQueryPayloadWarningPaths.has(ext.path)) {
+							this.sideQueryPayloadWarningPaths.add(ext.path);
+							const message = `Side-query cache warning: before_provider_request from ${ext.path} replaced the provider payload. Preserve the existing prompt prefix to retain cache reuse.`;
+							if (this.hasUI()) {
+								this.uiContext.notify(message, "warning");
+							} else {
+								console.warn(message);
+							}
+						}
 						currentPayload = handlerResult;
 					}
 				} catch (err) {

@@ -12,6 +12,8 @@ import type {
 	AgentMessage,
 	AgentToolResult,
 	AgentToolUpdateCallback,
+	SideQueryMode,
+	SideQueryOptions,
 	ThinkingLevel,
 	ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
@@ -22,6 +24,7 @@ import type {
 	ConstrainedSamplingConfig,
 	Context,
 	ImageContent,
+	Message,
 	Model,
 	OAuthCredentials,
 	OAuthLoginCallbacks,
@@ -85,7 +88,7 @@ import type {
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions } from "../system-prompt.ts";
-export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
+export type { AgentToolResult, AgentToolUpdateCallback, SideQueryMode, SideQueryOptions, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
 // ============================================================================
@@ -344,6 +347,12 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/**
+	 * Start one detached provider response without changing session history or executing tools.
+	 * Use `mode: "settled"` for current idle context or `mode: "latest"` for the most recently
+	 * dispatched provider context, including while the main agent is still working.
+	 */
+	sideQuery(input: string, options: SideQueryOptions): Promise<AssistantMessageEventStream>;
 }
 
 /**
@@ -364,10 +373,14 @@ export interface ExtensionCommandContext extends ExtensionContext {
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }>;
 
-	/** Fork from a specific entry, creating a new session file. */
+	/** Fork from a specific entry, optionally appending messages to the new branch. */
 	fork(
 		entryId: string,
-		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		options?: {
+			position?: "before" | "at";
+			appendMessages?: Message[];
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
 	): Promise<{ cancelled: boolean }>;
 
 	/** Navigate to a different point in the session tree. */
@@ -1663,6 +1676,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;
+	sideQuery: (input: string, options: SideQueryOptions) => Promise<AssistantMessageEventStream>;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
 }
 
@@ -1679,7 +1693,11 @@ export interface ExtensionCommandContextActions {
 	}) => Promise<{ cancelled: boolean }>;
 	fork: (
 		entryId: string,
-		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		options?: {
+			position?: "before" | "at";
+			appendMessages?: Message[];
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
 	) => Promise<{ cancelled: boolean }>;
 	navigateTree: (
 		targetId: string,

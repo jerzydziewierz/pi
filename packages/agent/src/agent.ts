@@ -1,4 +1,6 @@
 import type {
+	AssistantMessageEventStream,
+	Context,
 	ImageContent,
 	Message,
 	Model,
@@ -7,7 +9,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { prepareAgentRequest, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -29,6 +31,32 @@ import type {
 } from "./types.ts";
 
 export type { QueueMode } from "./types.ts";
+
+/** Context source used for a detached side query. */
+export type SideQueryMode = "settled" | "latest";
+
+/** Options for a detached, single-response side query. */
+export interface SideQueryOptions {
+	/**
+	 * `settled` requires the agent to be idle when invoked and snapshots the current transcript.
+	 * It does not reserve the agent lifecycle while the detached request is prepared or started.
+	 * `latest` reuses the most recently dispatched provider-request context and is available
+	 * while the agent is working.
+	 */
+	mode: SideQueryMode;
+	/** Abort only this side query. */
+	signal?: AbortSignal;
+	/** Override the model's normal response-token limit for this query. */
+	maxTokens?: number;
+	/** Images appended to the detached user message. */
+	images?: ImageContent[];
+}
+
+type LatestRequestSnapshot = {
+	model: Model<any>;
+	context: Context;
+	options: SimpleStreamOptions;
+};
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
@@ -102,6 +130,8 @@ export interface AgentOptions {
 	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Optional payload hook used only by detached side queries. Defaults to `onPayload`. */
+	onSideQueryPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
@@ -164,6 +194,11 @@ type ActiveRun = {
 	abortController: AbortController;
 };
 
+type ActiveSideQuery = {
+	abortController: AbortController;
+	detachCallerSignal: () => void;
+};
+
 /**
  * Stateful wrapper around the low-level agent loop.
  *
@@ -181,6 +216,7 @@ export class Agent {
 	public streamFunction: StreamFn;
 	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	public onPayload?: SimpleStreamOptions["onPayload"];
+	public onSideQueryPayload?: SimpleStreamOptions["onPayload"];
 	public onResponse?: SimpleStreamOptions["onResponse"];
 	public beforeToolCall?: (
 		context: BeforeToolCallContext,
@@ -202,6 +238,10 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private readonly activeSideQueries = new Set<ActiveSideQuery>();
+	private sideQueryIdlePromise?: Promise<void>;
+	private resolveSideQueryIdle?: () => void;
+	private latestRequest?: LatestRequestSnapshot;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -222,6 +262,7 @@ export class Agent {
 		this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn();
 		this.getApiKey = runtimeOptions.getApiKey;
 		this.onPayload = runtimeOptions.onPayload;
+		this.onSideQueryPayload = runtimeOptions.onSideQueryPayload;
 		this.onResponse = runtimeOptions.onResponse;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
@@ -315,9 +356,10 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
-	/** Abort the current run, if one is active. */
+	/** Abort the current run and all detached side queries. */
 	abort(): void {
 		this.activeRun?.abortController.abort();
+		this.abortSideQueries();
 	}
 
 	/**
@@ -329,17 +371,90 @@ export class Agent {
 		return this.activeRun?.promise ?? Promise.resolve();
 	}
 
-	/** Clear transcript state, runtime state, and queued messages. */
+	/** Resolve when every detached side query has finished. */
+	waitForSideQueries(): Promise<void> {
+		if (this.activeSideQueries.size === 0) {
+			return Promise.resolve();
+		}
+		if (!this.sideQueryIdlePromise) {
+			this.sideQueryIdlePromise = new Promise((resolve) => {
+				this.resolveSideQueryIdle = resolve;
+			});
+		}
+		return this.sideQueryIdlePromise;
+	}
+
+	/**
+	 * Start one detached provider response without changing the agent transcript or executing tools.
+	 *
+	 * `settled` checks for an idle agent at invocation and captures the current semantic context;
+	 * it does not lock the agent lifecycle during detached request setup. `latest` appends to the
+	 * most recently dispatched provider context, so it can run concurrently with the main agent
+	 * and preserve that request's cacheable prefix.
+	 */
+	async sideQuery(input: string, options: SideQueryOptions): Promise<AssistantMessageEventStream> {
+		return await this.startSideQuery(options.signal, async (signal) => {
+			const content: Array<TextContent | ImageContent> = [{ type: "text", text: input }];
+			if (options.images?.length) {
+				content.push(...options.images);
+			}
+			const userMessage: Message = { role: "user", content, timestamp: Date.now() };
+
+			if (options.mode === "settled") {
+				if (this.activeRun) {
+					throw new Error("Settled side queries require an idle agent.");
+				}
+				const context = this.createContextSnapshot();
+				context.messages.push(userMessage);
+				const request = await prepareAgentRequest(context, this.createLoopConfig(), signal);
+				return await this.streamFunction(request.model, request.context, {
+					...request.options,
+					onPayload: this.onSideQueryPayload ?? request.options.onPayload,
+					...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+				});
+			}
+
+			if (options.mode !== "latest") {
+				throw new Error(`Invalid side query mode: ${String(options.mode)}`);
+			}
+			const snapshot = this.latestRequest;
+			if (!snapshot) {
+				throw new Error("No provider request is available for a latest side query.");
+			}
+			const suffix = await this.convertToLlm([userMessage]);
+			const resolvedApiKey =
+				(this.getApiKey ? await this.getApiKey(snapshot.model.provider) : undefined) || snapshot.options.apiKey;
+			return await this.streamFunction(
+				snapshot.model,
+				{
+					systemPrompt: snapshot.context.systemPrompt,
+					messages: [...snapshot.context.messages, ...suffix],
+					tools: snapshot.context.tools?.slice(),
+				},
+				{
+					...snapshot.options,
+					apiKey: resolvedApiKey,
+					signal,
+					onPayload: this.onSideQueryPayload ?? snapshot.options.onPayload,
+					...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+				},
+			);
+		});
+	}
+
+	/** Clear transcript state, runtime state, cached request state, and queued messages. */
 	reset(): void {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before resetting.");
 		}
 
+		this.abortSideQueries();
 		this._state.messages = [];
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
 		this._state.errorMessage = undefined;
+		this.latestRequest = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
 	}
@@ -417,7 +532,7 @@ export class Agent {
 				this.createLoopConfig(options),
 				(event) => this.processEvents(event),
 				signal,
-				this.streamFunction,
+				this.streamAndCapture,
 			);
 		});
 	}
@@ -429,10 +544,72 @@ export class Agent {
 				this.createLoopConfig(),
 				(event) => this.processEvents(event),
 				signal,
-				this.streamFunction,
+				this.streamAndCapture,
 			);
 		});
 	}
+
+	private async startSideQuery(
+		callerSignal: AbortSignal | undefined,
+		start: (signal: AbortSignal) => Promise<AssistantMessageEventStream>,
+	): Promise<AssistantMessageEventStream> {
+		const abortController = new AbortController();
+		const forwardCallerAbort = () => abortController.abort(callerSignal?.reason);
+		if (callerSignal?.aborted) {
+			forwardCallerAbort();
+		} else {
+			callerSignal?.addEventListener("abort", forwardCallerAbort, { once: true });
+		}
+		const active: ActiveSideQuery = {
+			abortController,
+			detachCallerSignal: () => callerSignal?.removeEventListener("abort", forwardCallerAbort),
+		};
+		this.activeSideQueries.add(active);
+		const release = () => {
+			active.detachCallerSignal();
+			this.activeSideQueries.delete(active);
+			if (this.activeSideQueries.size === 0 && this.resolveSideQueryIdle) {
+				const resolve = this.resolveSideQueryIdle;
+				this.sideQueryIdlePromise = undefined;
+				this.resolveSideQueryIdle = undefined;
+				resolve();
+			}
+		};
+
+		try {
+			const stream = await start(abortController.signal);
+			void stream.result().then(release, release);
+			return stream;
+		} catch (error) {
+			release();
+			throw error;
+		}
+	}
+
+	private abortSideQueries(): void {
+		for (const active of this.activeSideQueries) {
+			active.abortController.abort();
+			active.detachCallerSignal();
+		}
+	}
+
+	private readonly streamAndCapture: StreamFn = async (model, context, options) => {
+		// Snapshot only top-level arrays. Provider request messages are treated as immutable,
+		// and tool definitions may contain functions that cannot be cloned.
+		const snapshot: LatestRequestSnapshot = {
+			model,
+			context: {
+				systemPrompt: context.systemPrompt,
+				messages: context.messages.slice(),
+				tools: context.tools?.slice(),
+			},
+			options: { ...options, signal: undefined },
+		};
+		const stream = await this.streamFunction(model, context, options);
+		// Stream-handle creation is the provider-independent boundary for a dispatched request.
+		this.latestRequest = snapshot;
+		return stream;
+	};
 
 	private createContextSnapshot(): AgentContext {
 		return {

@@ -24,6 +24,47 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+/** Fully prepared provider request produced from an agent context. */
+export interface PreparedAgentRequest {
+	model: AgentLoopConfig["model"];
+	context: Context;
+	options: AgentLoopConfig & { apiKey?: string; signal?: AbortSignal };
+}
+
+/**
+ * Apply the agent context pipeline and resolve credentials for one provider request.
+ * This does not start a provider stream. The top-level messages array is copied
+ * before hooks run; nested messages and tools retain their existing immutability expectations.
+ */
+export async function prepareAgentRequest(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal?: AbortSignal,
+): Promise<PreparedAgentRequest> {
+	let messages = context.messages.slice();
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	const llmMessages = await config.convertToLlm(messages);
+	const resolvedApiKey =
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+
+	return {
+		model: config.model,
+		context: {
+			systemPrompt: context.systemPrompt,
+			messages: llmMessages,
+			tools: context.tools,
+		},
+		options: {
+			...config,
+			apiKey: resolvedApiKey,
+			signal,
+		},
+	};
+}
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -285,31 +326,8 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
-
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
-
-	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
+	const request = await prepareAgentRequest(context, config, signal);
+	const response = await streamFunction(request.model, request.context, request.options);
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;

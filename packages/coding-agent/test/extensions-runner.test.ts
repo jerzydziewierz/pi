@@ -99,6 +99,9 @@ describe("ExtensionRunner", () => {
 		getContextUsage: () => undefined,
 		compact: () => {},
 		getSystemPrompt: () => "",
+		sideQuery: async () => {
+			throw new Error("unused");
+		},
 		getScopedModels: () => [],
 	};
 
@@ -979,6 +982,38 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.hasHandlers("tool_call")).toBe(true);
 			expect(runner.hasHandlers("agent_end")).toBe(false);
+		});
+	});
+
+	describe("before_provider_request", () => {
+		it("warns once with the extension path when a side-query payload is replaced", async () => {
+			const extensionPath = path.join(extensionsDir, "payload-rewriter.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`export default function(pi) {
+	pi.on("before_provider_request", (event) => ({ ...event.payload, rewritten: true }));
+}`,
+			);
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir,
+					sessionManager,
+					modelRegistry,
+				);
+
+				await runner.emitBeforeProviderRequest({ messages: [] }, { warnForSideQuery: true });
+				await runner.emitBeforeProviderRequest({ messages: [] }, { warnForSideQuery: true });
+
+				expect(warnSpy).toHaveBeenCalledTimes(1);
+				expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(extensionPath));
+				expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("before_provider_request"));
+			} finally {
+				warnSpy.mockRestore();
+			}
 		});
 	});
 

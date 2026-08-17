@@ -207,6 +207,10 @@ const agent = new Agent({
   // Dynamic API key resolution (for expiring OAuth tokens)
   getApiKey: async (provider) => refreshToken(),
 
+  // Provider payload hooks. onSideQueryPayload defaults to onPayload.
+  onPayload: async (payload, model) => payload,
+  onSideQueryPayload: async (payload, model) => payload,
+
   // Tool execution mode: "parallel" (default) or "sequential"
   toolExecution: "parallel",
 
@@ -286,6 +290,31 @@ await agent.prompt({ role: "user", content: "Hello", timestamp: Date.now() });
 await agent.continue();
 ```
 
+### Detached Side Queries
+
+`sideQuery()` starts one provider response without adding messages to agent state, emitting agent lifecycle events, or executing tool calls. The returned stream belongs to the caller, which can route its result to status UI, voice output, or another advice/detection subsystem.
+
+```typescript
+// Requires an idle agent and snapshots the current semantic context.
+const settledStream = await agent.sideQuery("Summarize current status", {
+  mode: "settled",
+  maxTokens: 200,
+});
+const settledResult = await settledStream.result();
+
+// Reuses the most recently dispatched provider context, including while the
+// parent agent is working, and appends only this converted user-message suffix.
+const latestStream = await agent.sideQuery("Has a failure condition appeared?", {
+  mode: "latest",
+  signal: controller.signal,
+});
+const latestResult = await latestStream.result();
+```
+
+`latest` preserves the existing provider-ready message and tool prefix for prompt-cache reuse. It does not rerun `transformContext`; it runs `convertToLlm` only on the new user-message suffix. Provider payload hooks still run and must be deterministic and preserve the existing prompt prefix to retain cache reuse.
+
+Tool schemas remain available to preserve the prefix, but a returned `toolUse` response is not executed. Side queries do not count toward `waitForIdle()`. `abort()` and `reset()` abort outstanding side queries; caller-provided abort signals abort only their query.
+
 ### State Management
 
 ```typescript
@@ -318,8 +347,9 @@ agent.thinkingBudgets = {
 ### Control
 
 ```typescript
-agent.abort();           // Cancel current operation
-await agent.waitForIdle(); // Wait for completion
+agent.abort();                         // Cancel the current run and detached side queries
+await agent.waitForIdle();             // Wait for the main run
+await agent.waitForSideQueries();       // Wait for detached queries
 ```
 
 ### Events

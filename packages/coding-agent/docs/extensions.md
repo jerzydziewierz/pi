@@ -692,6 +692,8 @@ pi.on("before_provider_request", (event, ctx) => {
 
 This is mainly useful for debugging provider serialization and cache behavior.
 
+Detached side queries also run this hook. To retain prompt-cache reuse, handlers must be deterministic and leave the existing serialized prompt prefix unchanged; only side-query suffix fields should differ. When a handler returns a replacement payload during a side query, Pi emits a warning naming the extension path and `before_provider_request` effect. The warning is conservative—it reports a possible cache-prefix change, not a provider-confirmed cache miss—and is shown once per extension runtime. A handler that mutates its payload in place and returns `undefined` cannot be detected.
+
 #### after_provider_response
 
 Fired after an HTTP response is received and before its stream body is consumed. Handlers run in extension load order.
@@ -1079,6 +1081,32 @@ pi.on("before_agent_start", (event, ctx) => {
 });
 ```
 
+### ctx.sideQuery(input, options)
+
+Start one detached provider response without adding messages to the session, emitting normal agent lifecycle events, or executing tool calls. The extension owns the returned stream and can route the result to a status line, voice output, advice subsystem, or condition detector.
+
+```typescript
+const stream = await ctx.sideQuery("Report progress and flag any failure condition", {
+  mode: "latest",
+  maxTokens: 200,
+});
+const result = await stream.result();
+
+const text = result.content
+  .filter((part) => part.type === "text")
+  .map((part) => part.text)
+  .join("");
+ctx.ui.setStatus("side-advice", text);
+```
+
+Modes:
+- `settled`: requires Pi to be idle when invoked and snapshots the current semantic context. Use it for command-driven queries.
+- `latest`: reuses the most recently dispatched provider context and can run while the parent agent is working. It preserves that request's message/tool prefix and converts only the new user-message suffix, enabling provider prompt-cache reuse.
+
+`latest` does not rerun `context` handlers. Provider request/response hooks still run; `before_provider_request` handlers must preserve the existing payload prefix as described above. Tool schemas remain present for cache fidelity, but a returned `toolUse` response is delivered to the extension without tool execution.
+
+Side queries are detached from `ctx.isIdle()` and `ctx.waitForIdle()`. They are aborted when their originating session is reset, replaced, reloaded, or disposed. Use `options.signal` when the extension also needs to cancel an individual query. The result stream remains with the extension and resolves to an aborted assistant result when the provider honors cancellation.
+
 ## ExtensionCommandContext
 
 Command handlers receive `ExtensionCommandContext`, which extends `ExtensionContext` with session control methods. These are only available in commands because they can deadlock if called from event handlers.
@@ -1147,10 +1175,20 @@ Options:
 Fork from a specific entry, creating a new session file:
 
 ```typescript
+const sideQuestion = {
+  role: "user" as const,
+  content: [{ type: "text" as const, text: "Report current status" }],
+  timestamp: Date.now(),
+};
+const sideStream = await ctx.sideQuery("Report current status", { mode: "latest" });
+const sideAnswer = await sideStream.result();
+
 const result = await ctx.fork("entry-id-123", {
+  position: "at",
+  appendMessages: [sideQuestion, sideAnswer],
   withSession: async (ctx) => {
     // Use only the replacement-session ctx here.
-    ctx.ui.notify("Now in the forked session", "info");
+    ctx.ui.notify("Promoted side query into the fork", "info");
   },
 });
 if (result.cancelled) {
@@ -1166,6 +1204,7 @@ if (cloneResult.cancelled) {
 Options:
 - `position`: `"before"` (default) forks before the selected user message, restoring that prompt into the editor
 - `position`: `"at"` duplicates the active path through the selected entry without restoring editor text
+- `appendMessages`: standard user/assistant/tool-result messages to append to the new branch before `withSession`; intended for promoting detached side-query Q/A without exposing unrestricted `SessionManager` mutation
 - `withSession`: run post-switch work against a fresh replacement-session context. Do not use captured old `pi` / command `ctx`; see [Session replacement lifecycle and footguns](#session-replacement-lifecycle-and-footguns).
 
 ### ctx.navigateTree(targetId, options?)

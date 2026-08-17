@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, prepareAgentRequest } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
@@ -116,6 +116,28 @@ describe("default stream function compatibility", () => {
 });
 
 describe("agentLoop with AgentMessage", () => {
+	it("isolates the supplied messages array from context transforms", async () => {
+		const originalMessage = createUserMessage("original");
+		const context: AgentContext = {
+			systemPrompt: "system",
+			messages: [originalMessage],
+			tools: [],
+		};
+		const appendedMessage = createUserMessage("appended by hook");
+		const request = await prepareAgentRequest(context, {
+			model: createModel(),
+			transformContext: async (messages) => {
+				messages.push(appendedMessage);
+				return messages;
+			},
+			convertToLlm: identityConverter,
+		});
+
+		expect(context.messages).toEqual([originalMessage]);
+		expect(request.context.messages).toEqual([originalMessage, appendedMessage]);
+		expect(request.context.messages[0]).toBe(originalMessage);
+	});
+
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: "You are helpful.",

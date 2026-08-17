@@ -338,6 +338,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return runner.emitBeforeProviderRequest(payload);
 		},
+		onSideQueryPayload: async (payload, _model) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner?.hasHandlers("before_provider_request")) {
+				return payload;
+			}
+			return runner.emitBeforeProviderRequest(payload, { warnForSideQuery: true });
+		},
 		onResponse: async (response, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("after_provider_response")) {

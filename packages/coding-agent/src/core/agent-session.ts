@@ -1550,7 +1550,7 @@ export class AgentSession {
 	async abort(): Promise<void> {
 		this.abortRetry();
 		this.agent.abort();
-		await this.waitForIdle();
+		await Promise.all([this.waitForIdle(), this.agent.waitForSideQueries()]);
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -2472,6 +2472,7 @@ export class AgentSession {
 					})();
 				},
 				getSystemPrompt: () => this.systemPrompt,
+				sideQuery: (input, options) => this.agent.sideQuery(input, options),
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 			},
 			{
@@ -2641,6 +2642,7 @@ export class AgentSession {
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
+		await this.abort();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
 		await this.settingsManager.reload();

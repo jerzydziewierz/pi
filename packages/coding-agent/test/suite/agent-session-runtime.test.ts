@@ -122,6 +122,42 @@ describe("AgentSessionRuntime characterization", () => {
 		return { runtime, faux, tempDir };
 	}
 
+	it("aborts side queries before quit shutdown handlers run", async () => {
+		let sideResult: Promise<{ stopReason: string }> = Promise.resolve({ stopReason: "pending" });
+		let shutdownCompleted = false;
+		let sideStarted!: () => void;
+		const sideStartedPromise = new Promise<void>((resolve) => {
+			sideStarted = resolve;
+		});
+		const { runtime, faux } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("session_shutdown", async () => {
+				await sideResult;
+				shutdownCompleted = true;
+			});
+		});
+		faux.setResponses([
+			(_context, options) =>
+				new Promise((resolve) => {
+					sideStarted();
+					const finish = () =>
+						resolve(fauxAssistantMessage("", { stopReason: "aborted", errorMessage: "aborted" }));
+					if (options?.signal?.aborted) {
+						finish();
+					} else {
+						options?.signal?.addEventListener("abort", finish, { once: true });
+					}
+				}),
+		]);
+
+		const stream = await runtime.session.extensionRunner.createContext().sideQuery("watch quit", { mode: "settled" });
+		sideResult = stream.result();
+		await sideStartedPromise;
+		await runtime.dispose();
+
+		expect((await sideResult).stopReason).toBe("aborted");
+		expect(shutdownCompleted).toBe(true);
+	});
+
 	it("persists message_end assistant replacements to the session manager", async () => {
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
 			pi.on("message_end", (event) => {
@@ -392,6 +428,34 @@ describe("AgentSessionRuntime characterization", () => {
 						: undefined,
 			})),
 		).toEqual(beforeMessages);
+	});
+
+	it("appends promotion messages only in the new fork and rebuilds agent context", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("parent question");
+		const previousSessionFile = runtime.session.sessionFile;
+		const previousMessageCount = runtime.session.messages.length;
+		const leafId = runtime.session.sessionManager.getLeafId();
+		expect(previousSessionFile).toBeDefined();
+		expect(leafId).toBeTruthy();
+
+		const sideAnswer = fauxAssistantMessage("side answer");
+		const result = await runtime.fork(leafId!, {
+			position: "at",
+			appendMessages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "side question" }],
+					timestamp: Date.now(),
+				},
+				sideAnswer,
+			],
+		});
+
+		expect(result).toEqual({ cancelled: false, selectedText: undefined });
+		expect(runtime.session.messages.slice(-2)).toEqual([expect.objectContaining({ role: "user" }), sideAnswer]);
+		const sourceSession = SessionManager.open(previousSessionFile!);
+		expect(sourceSession.buildSessionContext().messages).toHaveLength(previousMessageCount);
 	});
 
 	it("duplicates the current active branch in-memory when forking at the current position", async () => {

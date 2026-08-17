@@ -1,4 +1,11 @@
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	type Context,
+	EventStream,
+	getModel,
+	type Message,
+} from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
@@ -806,5 +813,219 @@ describe("Agent", () => {
 
 		await agent.prompt("hello again");
 		expect(receivedSessionId).toBe("session-def");
+	});
+
+	it("returns a settled tool-use response without mutating the transcript or executing tools", async () => {
+		const toolSchema = Type.Object({});
+		let toolExecutions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "never_run",
+			label: "Never run",
+			description: "Must remain a schema only",
+			parameters: toolSchema,
+			async execute() {
+				toolExecutions++;
+				return { content: [{ type: "text", text: "unexpected" }], details: {} };
+			},
+		};
+		const initialMessage = { role: "user" as const, content: "parent", timestamp: 1 };
+		let requestContext: Context | undefined;
+		let requestSessionId: string | undefined;
+		let requestMaxTokens: number | undefined;
+		const normalPayloadCallback = () => undefined;
+		const sidePayloadCallback = () => undefined;
+		let requestPayloadCallback: unknown;
+		let retainedResponseCallback = false;
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "system",
+				messages: [initialMessage],
+				tools: [tool],
+			},
+			sessionId: "session-cache-key",
+			transformContext: async (messages) => messages,
+			onPayload: normalPayloadCallback,
+			onSideQueryPayload: sidePayloadCallback,
+			onResponse: () => undefined,
+			streamFn: (_model, context, options) => {
+				requestContext = context;
+				requestSessionId = options?.sessionId;
+				requestMaxTokens = options?.maxTokens;
+				requestPayloadCallback = options?.onPayload;
+				retainedResponseCallback = options?.onResponse !== undefined;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantToolUseMessage([
+						{ type: "toolCall", id: "side-tool-1", name: "never_run", arguments: {} },
+					]);
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			},
+		});
+
+		const stream = await agent.sideQuery("side question", { mode: "settled", maxTokens: 123 });
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(requestContext?.systemPrompt).toBe("system");
+		expect(requestContext?.tools).toEqual([tool]);
+		expect(requestContext?.messages).toHaveLength(2);
+		expect(requestSessionId).toBe("session-cache-key");
+		expect(requestMaxTokens).toBe(123);
+		expect(requestPayloadCallback).toBe(sidePayloadCallback);
+		expect(retainedResponseCallback).toBe(true);
+		expect(agent.state.messages).toEqual([initialMessage]);
+		expect(toolExecutions).toBe(0);
+	});
+
+	it("runs a latest side query during an active run from the last dispatched context", async () => {
+		const mainStarted = createDeferred();
+		const releaseMain = createDeferred();
+		const contexts: Context[] = [];
+		const conversionBatchSizes: number[] = [];
+		let call = 0;
+		const agent = new Agent({
+			sessionId: "shared-session",
+			convertToLlm: (messages) => {
+				conversionBatchSizes.push(messages.length);
+				return messages.filter(
+					(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+				) as Message[];
+			},
+			streamFn: (_model, context, options) => {
+				contexts.push(context);
+				call++;
+				const stream = new MockAssistantStream();
+				if (call === 1) {
+					queueMicrotask(async () => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						mainStarted.resolve();
+						await releaseMain.promise;
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("main answer") });
+					});
+				} else {
+					expect(options?.sessionId).toBe("shared-session");
+					queueMicrotask(() => {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("status") });
+					});
+				}
+				return stream;
+			},
+		});
+
+		const mainPrompt = agent.prompt("work");
+		await mainStarted.promise;
+		await expect(agent.sideQuery("settled?", { mode: "settled" })).rejects.toThrow(
+			"Settled side queries require an idle agent.",
+		);
+
+		const sideStream = await agent.sideQuery("status now", { mode: "latest" });
+		await sideStream.result();
+
+		expect(contexts).toHaveLength(2);
+		expect(contexts[1].systemPrompt).toBe(contexts[0].systemPrompt);
+		expect(contexts[1].tools).toEqual(contexts[0].tools);
+		expect(contexts[1].messages.slice(0, -1)).toEqual(contexts[0].messages);
+		expect(contexts[1].messages.at(-1)?.role).toBe("user");
+		expect(conversionBatchSizes).toEqual([1, 1]);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["user"]);
+
+		releaseMain.resolve();
+		await mainPrompt;
+	});
+
+	it("uses the latest dispatched context after that request ends with an error", async () => {
+		const contexts: Context[] = [];
+		let call = 0;
+		const agent = new Agent({
+			streamFn: (_model, context) => {
+				contexts.push(context);
+				call++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					if (call === 2) {
+						const error = {
+							...createAssistantMessage(""),
+							stopReason: "error" as const,
+							errorMessage: "provider failed",
+						};
+						stream.push({ type: "error", reason: "error", error });
+						return;
+					}
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("prime request");
+		await agent.prompt("dispatched request that errors");
+		const sideStream = await agent.sideQuery("use dispatched request", { mode: "latest" });
+		await sideStream.result();
+
+		expect(contexts).toHaveLength(3);
+		expect(contexts[2].messages.slice(0, -1)).toEqual(contexts[1].messages);
+		expect(contexts[2].messages).toHaveLength(contexts[1].messages.length + 1);
+		expect(contexts[2].messages.at(-1)?.role).toBe("user");
+	});
+
+	it("aborts detached side queries on reset while leaving their result stream with the caller", async () => {
+		const sideStarted = createDeferred();
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					sideStarted.resolve();
+					options?.signal?.addEventListener(
+						"abort",
+						() => {
+							const error = {
+								...createAssistantMessage(""),
+								stopReason: "aborted" as const,
+								errorMessage: "aborted",
+							};
+							stream.push({ type: "error", reason: "aborted", error });
+						},
+						{ once: true },
+					);
+				});
+				return stream;
+			},
+		});
+
+		const sideStream = await agent.sideQuery("status", { mode: "settled" });
+		await sideStarted.promise;
+		const sideQueriesIdle = agent.waitForSideQueries();
+		agent.reset();
+		const result = await sideStream.result();
+		await sideQueriesIdle;
+
+		expect(result.stopReason).toBe("aborted");
+		expect(agent.state.messages).toEqual([]);
+	});
+
+	it("rejects latest side queries before any provider request and after reset", async () => {
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		await expect(agent.sideQuery("status", { mode: "latest" })).rejects.toThrow(
+			"No provider request is available for a latest side query.",
+		);
+		await expect(agent.sideQuery("status", { mode: "invalid" as "latest" })).rejects.toThrow(
+			"Invalid side query mode: invalid",
+		);
+		await agent.prompt("prime");
+		agent.reset();
+		await expect(agent.sideQuery("status", { mode: "latest" })).rejects.toThrow(
+			"No provider request is available for a latest side query.",
+		);
 	});
 });

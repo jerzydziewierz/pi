@@ -149,12 +149,20 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			tools: [],
 		},
 		convertToLlm,
+		sessionId: sessionManager.getSessionId(),
 		onPayload: async (payload) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
 				return payload;
 			}
 			return runner.emitBeforeProviderRequest(payload);
+		},
+		onSideQueryPayload: async (payload) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner?.hasHandlers("before_provider_request")) {
+				return payload;
+			}
+			return runner.emitBeforeProviderRequest(payload, { warnForSideQuery: true });
 		},
 		onResponse: async (response) => {
 			const runner = extensionRunnerRef.current;

@@ -2048,6 +2048,7 @@ export class InteractiveMode {
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
+			sideQuery: (input, options) => this.session.agent.sideQuery(input, options),
 		});
 
 		// Set up the extension shortcut handler on the default editor

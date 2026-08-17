@@ -127,6 +127,8 @@ export type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionTreeEvent,
+	SideQueryMode,
+	SideQueryOptions,
 	SlashCommandInfo,
 	SlashCommandSource,
 	SourceInfo,
