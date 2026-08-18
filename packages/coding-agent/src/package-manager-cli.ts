@@ -11,6 +11,7 @@ import {
 	getPackageDir,
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
+	getSelfUpdateUnavailableReason,
 	PACKAGE_NAME,
 	type SelfUpdateCommand,
 	type SelfUpdatePackageTarget,
@@ -422,18 +423,40 @@ async function refreshModelCatalogs(agentDir: string): Promise<void> {
 	console.log(chalk.green("Model catalogs refreshed"));
 }
 
+/**
+ * Report that self-update will not run.
+ *
+ * An installation pi does not own (local release directory, wrapper, source
+ * checkout) is a normal deployment, so it declines on stdout and exits 0. Only a
+ * genuine fault -- an owned install that is not writable, or an unsupported
+ * install method -- is an error.
+ */
 function printSelfUpdateUnavailable(
 	npmCommand?: string[],
 	updatePackageTarget: SelfUpdatePackageTarget = PACKAGE_NAME,
-): void {
-	console.error(`error: ${APP_NAME} cannot self-update this installation.`);
-	console.error(getSelfUpdateUnavailableInstruction(PACKAGE_NAME, npmCommand, updatePackageTarget));
-
+): boolean {
+	const reason = getSelfUpdateUnavailableReason(PACKAGE_NAME, npmCommand, updatePackageTarget);
+	const instruction = getSelfUpdateUnavailableInstruction(PACKAGE_NAME, npmCommand, updatePackageTarget);
 	const entrypoint = process.argv[1];
+	const isFault = reason === "not-writable" || reason === "unsupported";
+
+	if (!isFault) {
+		console.log(chalk.yellow(`${APP_NAME} does not manage this installation, so it will not self-update it.`));
+		console.log(chalk.dim(instruction));
+		if (entrypoint) {
+			console.log(chalk.dim(`Location of ${APP_NAME} executable: ${entrypoint}`));
+		}
+		return false;
+	}
+
+	console.error(`error: ${APP_NAME} cannot self-update this installation.`);
+	console.error(instruction);
+
 	if (entrypoint) {
 		console.error("");
 		console.error(`Location of ${APP_NAME} executable: ${entrypoint}`);
 	}
+	return true;
 }
 
 function printSelfUpdateFallback(command: SelfUpdateCommand): void {
@@ -853,8 +876,9 @@ export async function handlePackageCommand(
 					};
 					const selfUpdateCommand = getSelfUpdateCommand(PACKAGE_NAME, selfUpdateNpmCommand, selfUpdateTarget);
 					if (!selfUpdateCommand) {
-						printSelfUpdateUnavailable(selfUpdateNpmCommand, selfUpdateTarget);
-						process.exitCode = 1;
+						if (printSelfUpdateUnavailable(selfUpdateNpmCommand, selfUpdateTarget)) {
+							process.exitCode = 1;
+						}
 						return true;
 					}
 					if (selfUpdatePlan.note) {

@@ -325,6 +325,35 @@ export function getSelfUpdateCommand(
 	return command;
 }
 
+/**
+ * Why `getSelfUpdateCommand` returned nothing.
+ *
+ * `unmanaged` is an ordinary, expected deployment shape (local release directory,
+ * wrapper script, source checkout), not a fault: pi simply is not the owner of
+ * this installation. `not-writable` is a genuine misconfiguration of an install
+ * pi would otherwise own.
+ */
+export type SelfUpdateUnavailableReason = "bun-binary" | "unmanaged" | "not-writable" | "unsupported";
+
+export function getSelfUpdateUnavailableReason(
+	packageName: string,
+	npmCommand?: string[],
+	updatePackageTarget: SelfUpdatePackageTarget = packageName,
+): SelfUpdateUnavailableReason {
+	const method = detectInstallMethod();
+	if (method === "bun-binary") {
+		return "bun-binary";
+	}
+	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
+	if (!getSelfUpdateCommandForMethod(method, packageName, target, npmCommand)) {
+		return "unsupported";
+	}
+	if (!isManagedByGlobalPackageManager(method, packageName, npmCommand)) {
+		return "unmanaged";
+	}
+	return isSelfUpdatePathWritable() ? "unmanaged" : "not-writable";
+}
+
 export function getSelfUpdateUnavailableInstruction(
 	packageName: string,
 	npmCommand?: string[],
@@ -490,6 +519,29 @@ export const APP_NAME: string = piConfigName || "pi";
 export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 export const VERSION: string = pkg.version || "0.0.0";
+
+// =============================================================================
+// Fork identification
+// =============================================================================
+
+/**
+ * Upstream commit this fork is based on, and the name of the custom feature.
+ *
+ * `sideQueryWithCache` adds a cache-aware detached side-query core that upstream
+ * does not provide. Keep these in sync when merging a new upstream base; see the
+ * `update-pi-fork` skill.
+ */
+export const FORK_NAME = "sideQueryWithCache";
+export const FORK_UPSTREAM_BASE = "080932e53";
+
+/**
+ * Version string for human display and `--version`.
+ *
+ * Uses semver build metadata (`+...`), which `isNewerPackageVersion`, the pi.dev
+ * update check, and external consumers such as pi-acp all still parse as
+ * `VERSION`. Never use this for version comparisons -- compare with `VERSION`.
+ */
+export const DISPLAY_VERSION = `${VERSION}+fork.${FORK_NAME}.upstream.${FORK_UPSTREAM_BASE}`;
 
 // e.g., PI_CODING_AGENT_DIR or TAU_CODING_AGENT_DIR
 export const ENV_AGENT_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`;

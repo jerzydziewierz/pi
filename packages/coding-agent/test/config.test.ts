@@ -3,10 +3,15 @@ import { tmpdir } from "os";
 import { delimiter, join } from "path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
+	DISPLAY_VERSION,
 	detectInstallMethod,
+	FORK_NAME,
+	FORK_UPSTREAM_BASE,
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
+	getSelfUpdateUnavailableReason,
 	getUpdateInstruction,
+	VERSION,
 } from "../src/config.ts";
 
 const execPathDescriptor = Object.getOwnPropertyDescriptor(process, "execPath");
@@ -433,5 +438,28 @@ describe("detectInstallMethod", () => {
 		expect(getSelfUpdateUnavailableInstruction("@earendil-works/pi-coding-agent")).toContain(
 			"the install path is not writable",
 		);
+		expect(getSelfUpdateUnavailableReason("@earendil-works/pi-coding-agent")).toBe("not-writable");
+	});
+
+	test("DISPLAY_VERSION identifies the fork and its upstream base without breaking semver parsing", () => {
+		expect(DISPLAY_VERSION.startsWith(`${VERSION}+`)).toBe(true);
+		expect(DISPLAY_VERSION).toContain(FORK_NAME);
+		expect(DISPLAY_VERSION).toContain(FORK_UPSTREAM_BASE);
+		// pi-acp and the pi.dev update check accept semver build metadata.
+		expect(/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(DISPLAY_VERSION)).toBe(true);
+		// Comparisons must keep using the bare version.
+		expect(VERSION).not.toContain("+");
+	});
+
+	test("reports an unowned local release install as unmanaged rather than a fault", () => {
+		const releaseRoot = mkdtempSync(join(tmpdir(), "pi-local-release-"));
+		tempDir = releaseRoot;
+		const packageDir = join(releaseRoot, "node", "node_modules", "@earendil-works", "pi-coding-agent");
+		mkdirSync(packageDir, { recursive: true });
+		process.env.PI_PACKAGE_DIR = packageDir;
+		setExecPath(join(packageDir, "dist", "cli.js"));
+
+		expect(getSelfUpdateCommand("@earendil-works/pi-coding-agent")).toBeUndefined();
+		expect(getSelfUpdateUnavailableReason("@earendil-works/pi-coding-agent")).toBe("unmanaged");
 	});
 });
