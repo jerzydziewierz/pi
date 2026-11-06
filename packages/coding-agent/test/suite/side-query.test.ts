@@ -23,7 +23,6 @@ describe("side query", () => {
 	it("reuses the parent prompt cache and context hooks without adding session entries", async () => {
 		let contextHookCount = 0;
 		const harness = await createHarness({
-			systemPrompt: "stable system prefix",
 			extensionFactories: [
 				(pi: ExtensionAPI) => {
 					pi.on("context", (event) => {
@@ -87,7 +86,6 @@ describe("side query", () => {
 		const releaseActiveRequest = createDeferred();
 		let contextHookCount = 0;
 		const harness = await createHarness({
-			systemPrompt: "stable system prefix",
 			extensionFactories: [
 				(pi: ExtensionAPI) => {
 					pi.on("context", (event) => {

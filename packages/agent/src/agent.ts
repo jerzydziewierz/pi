@@ -1,13 +1,19 @@
-import type {
-	AssistantMessageEventStream,
-	Context,
-	ImageContent,
-	Message,
-	Model,
-	SimpleStreamOptions,
-	TextContent,
-	ThinkingBudgets,
-	Transport,
+import {
+	type AssistantMessageEventStream,
+	type ClientIdentity,
+	createInitialSystemMessage,
+	getCurrentSystemMessage,
+	getCurrentSystemPrompt,
+	type ImageContent,
+	type Message,
+	type Model,
+	normalizeContext,
+	type SimpleStreamOptions,
+	type TextContent,
+	type ThinkingBudgets,
+	type TranscriptContext,
+	type Transport,
+	toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import { prepareAgentRequest, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
@@ -23,9 +29,10 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	FinishTurn,
 	PrepareNextTurnContext,
+	PrepareRequest,
 	QueueMode,
-	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.ts";
@@ -54,13 +61,17 @@ export interface SideQueryOptions {
 
 type LatestRequestSnapshot = {
 	model: Model<any>;
-	context: Context;
+	context: TranscriptContext;
 	options: SimpleStreamOptions;
 };
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
-		(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+		(message) =>
+			message.role === "system" ||
+			message.role === "user" ||
+			message.role === "assistant" ||
+			message.role === "toolResult",
 	);
 }
 
@@ -93,14 +104,21 @@ type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "
 	errorMessage?: string;
 };
 
-function createMutableAgentState(
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>,
-): MutableAgentState {
+/** Initial state for {@link Agent}. `systemPrompt` and `tools` become the leading system message unless `messages` already starts with one. */
+export type AgentInitialState = Partial<
+	Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">
+>;
+
+function createMutableAgentState(initialState?: AgentInitialState): MutableAgentState {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
+	const initialMessage = createInitialSystemMessage(initialState?.systemPrompt, tools.map(toToolDeclaration));
+	if (messages[0]?.role !== "system" && initialMessage) messages.unshift(initialMessage);
 
 	return {
-		systemPrompt: initialState?.systemPrompt ?? "",
+		get systemPrompt() {
+			return getCurrentSystemPrompt(messages);
+		},
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
 		get tools() {
@@ -124,7 +142,7 @@ function createMutableAgentState(
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>;
+	initialState?: AgentInitialState;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	streamFn: StreamFn;
@@ -133,9 +151,11 @@ export interface AgentOptions {
 	/** Optional payload hook used only by detached side queries. Defaults to `onPayload`. */
 	onSideQueryPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
+	onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
-	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
+	finishTurn?: FinishTurn;
+	prepareRequest?: PrepareRequest;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -150,6 +170,11 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+	/**
+	 * How requests identify the app to providers, merged field by field over `DEFAULT_AGENT_IDENTITY`
+	 * (`{ attribution: PI_ATTRIBUTION }`). Pass `{ attribution: null }` to send no attribution headers.
+	 */
+	identity?: ClientIdentity;
 }
 
 class PendingMessageQueue {
@@ -168,19 +193,16 @@ class PendingMessageQueue {
 		return this.messages.length > 0;
 	}
 
-	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
-			return drained;
-		}
-
+	peek(): AgentMessage[] {
+		if (this.mode === "all") return this.messages.slice();
 		const first = this.messages[0];
-		if (!first) {
-			return [];
-		}
-		this.messages = this.messages.slice(1);
-		return [first];
+		return first ? [first] : [];
+	}
+
+	drain(): AgentMessage[] {
+		const drained = this.peek();
+		this.messages = this.messages.slice(drained.length);
+		return drained;
 	}
 
 	clear(): void {
@@ -218,6 +240,7 @@ export class Agent {
 	public onPayload?: SimpleStreamOptions["onPayload"];
 	public onSideQueryPayload?: SimpleStreamOptions["onPayload"];
 	public onResponse?: SimpleStreamOptions["onResponse"];
+	public onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
 	public beforeToolCall?: (
 		context: BeforeToolCallContext,
 		signal?: AbortSignal,
@@ -226,10 +249,8 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
-	public shouldStopAfterTurn?: (
-		context: ShouldStopAfterTurnContext,
-		signal?: AbortSignal,
-	) => boolean | Promise<boolean>;
+	public finishTurn?: FinishTurn;
+	public prepareRequest?: PrepareRequest;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -252,6 +273,8 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
+	/** Request identity forwarded to the stream function, over `DEFAULT_AGENT_IDENTITY`. */
+	public identity?: ClientIdentity;
 
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
@@ -264,9 +287,11 @@ export class Agent {
 		this.onPayload = runtimeOptions.onPayload;
 		this.onSideQueryPayload = runtimeOptions.onSideQueryPayload;
 		this.onResponse = runtimeOptions.onResponse;
+		this.onProviderStreamEvent = runtimeOptions.onProviderStreamEvent;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
-		this.shouldStopAfterTurn = runtimeOptions.shouldStopAfterTurn;
+		this.finishTurn = runtimeOptions.finishTurn;
+		this.prepareRequest = runtimeOptions.prepareRequest;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -276,6 +301,7 @@ export class Agent {
 		this.transport = runtimeOptions.transport ?? "auto";
 		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
 		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
+		this.identity = runtimeOptions.identity;
 	}
 
 	/**
@@ -349,6 +375,12 @@ export class Agent {
 	/** Returns true when either queue still contains pending messages. */
 	hasQueuedMessages(): boolean {
 		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
+	}
+
+	/** Preview the messages selected for the next turn without consuming them. */
+	peekQueuedMessages(): AgentMessage[] {
+		const steering = this.steeringQueue.peek();
+		return steering.length > 0 ? steering : this.followUpQueue.peek();
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -426,11 +458,7 @@ export class Agent {
 				(this.getApiKey ? await this.getApiKey(snapshot.model.provider) : undefined) || snapshot.options.apiKey;
 			return await this.streamFunction(
 				snapshot.model,
-				{
-					systemPrompt: snapshot.context.systemPrompt,
-					messages: [...snapshot.context.messages, ...suffix],
-					tools: snapshot.context.tools?.slice(),
-				},
+				normalizeContext({ messages: [...snapshot.context.messages, ...suffix] }),
 				{
 					...snapshot.options,
 					apiKey: resolvedApiKey,
@@ -442,14 +470,15 @@ export class Agent {
 		});
 	}
 
-	/** Clear transcript state, runtime state, cached request state, and queued messages. */
+	/** Clear conversation state, side queries, and queues while retaining the replayed prompt/tool baseline. */
 	reset(): void {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before resetting.");
 		}
 
 		this.abortSideQueries();
-		this._state.messages = [];
+		const baseline = getCurrentSystemMessage(this._state.messages);
+		this._state.messages = baseline ? [baseline] : [];
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -479,7 +508,7 @@ export class Agent {
 		}
 
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
-		if (!lastMessage) {
+		if (!lastMessage || this._state.messages.every((message) => message.role === "system")) {
 			throw new Error("No messages to continue from");
 		}
 
@@ -598,11 +627,7 @@ export class Agent {
 		// and tool definitions may contain functions that cannot be cloned.
 		const snapshot: LatestRequestSnapshot = {
 			model,
-			context: {
-				systemPrompt: context.systemPrompt,
-				messages: context.messages.slice(),
-				tools: context.tools?.slice(),
-			},
+			context: normalizeContext({ messages: context.messages.slice() }),
 			options: { ...options, signal: undefined },
 		};
 		const stream = await this.streamFunction(model, context, options);
@@ -613,7 +638,6 @@ export class Agent {
 
 	private createContextSnapshot(): AgentContext {
 		return {
-			systemPrompt: this._state.systemPrompt,
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
 		};
@@ -621,22 +645,22 @@ export class Agent {
 
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
-		const shouldStopAfterTurn = this.shouldStopAfterTurn;
 		return {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,
 			onPayload: this.onPayload,
 			onResponse: this.onResponse,
+			onProviderStreamEvent: this.onProviderStreamEvent,
 			transport: this.transport,
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
+			identity: this.identity,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
-			shouldStopAfterTurn: shouldStopAfterTurn
-				? async (context) => await shouldStopAfterTurn(context, this.signal)
-				: undefined,
+			finishTurn: this.finishTurn,
+			prepareRequest: this.prepareRequest,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

@@ -1,8 +1,12 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
+
+/** OSC 133 prompt markers at the start of a rendered line. Fullscreen uses them for prompt navigation. */
+const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
@@ -260,7 +264,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		};
 
 		// Render all components to get new lines
-		let newLines = this.render(width);
+		// Resolve fake cursors before compositing so overlays and line slicing see plain SGR codes
+		// Drop OSC 133 markers: the terminal reads 133;A as a new shell prompt, which ends program status (OSC 7501)
+		let newLines = this.resolveFakeCursors(this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, "")));
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.hasOverlayEntries) {
@@ -317,10 +323,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousHeight = height;
 		};
 
-		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
+		const redrawLogDirectory = process.env.PI_TUI_DEBUG_REDRAW === "1" ? this.logDirectory : undefined;
 		const logRedraw = (reason: string): void => {
-			if (!debugRedraw) return;
-			const logPath = path.join(this.logDirectory, "pi-debug.log");
+			if (redrawLogDirectory === undefined) return;
+			const logPath = path.join(redrawLogDirectory, "pi-tui-debug.log");
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})\n`;
 			fs.mkdirSync(path.dirname(logPath), { recursive: true });
 			fs.appendFileSync(logPath, msg);
@@ -351,7 +357,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Content shrunk below the working area and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
-		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
+		// Configurable via setClearOnShrink()
 		if (this.getClearOnShrink() && newLines.length < this.maxLinesRendered && !this.hasOverlayEntries) {
 			logRedraw(`clearOnShrink (maxLinesRendered=${this.maxLinesRendered})`);
 			fullRender(true);
@@ -515,7 +521,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			output.append("\x1b[2K"); // Clear current line
 			if (!isImage && visibleWidth(line) > width) {
 				// Log all lines to crash file for debugging
-				const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
+				const crashLogPath = path.join(this.logDirectory ?? os.tmpdir(), "pi-tui-crash.log");
 				const crashData = [
 					`Crash at ${new Date().toISOString()}`,
 					`Terminal width: ${width}`,
